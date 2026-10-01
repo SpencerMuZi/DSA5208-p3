@@ -2,7 +2,7 @@
 
 这是可运行的项目起步包：serial、MPI、MPI+OpenMP、非阻塞 MPI+OpenMP 四个版本，验证脚本、PBS 作业生成器和三人操作指南。
 
-先读 `docs/总实施方案.md`，再按角色读 `docs/A_操作指南_Windows.md`、`docs/B_操作指南_Windows.md`、`docs/C_操作指南_Mac.md`。共同部署步骤在 `docs/共同部署与命令说明.md`。本地验证范围见 `docs/验证记录.md`。
+先读 [ABC 顺序汇总操作指南](docs/ABC_顺序汇总操作指南.md)，按阶段明确先后、并行工作和交接条件；背景与实验设计看 `docs/总实施方案.md`，具体命令按角色看 `docs/A_操作指南_Windows.md`、`docs/B_操作指南_Windows.md`、`docs/C_操作指南_Mac.md`。共同部署步骤在 `docs/共同部署与命令说明.md`。本地验证范围见 `docs/验证记录.md`。
 
 账号/队列/模块与正式实验尚未完成。这里没有 Atlas/Vanda 性能数据，也没有最终 PDF。现有图表和本地日志（如有）只能用于开发验证。
 
