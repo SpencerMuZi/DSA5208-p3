@@ -1,0 +1,15 @@
+bin/
+.DS_Store
+*.pyc
+.pytest_cache/
+.venv/
+__pycache__/
+configs/cluster.env
+configs/site_modules.sh
+results/
+figures/
+jobs/generated/
+dist/
+*.o
+*.o[0-9]*
+*.e[0-9]*

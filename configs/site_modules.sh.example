@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Copy to configs/site_modules.sh. Fill actual compiler/MPI modules after login.
+# This file is sourced by build.sh and every generated PBS job.
+# If needed, initialize the module command using the site-approved profile first.
+# module load ACTUAL_COMPILER_MODULE
+# module load ACTUAL_OPENMPI_MODULE
+# Never leave fictitious module names in executable commands.
+export SERIAL_CXX=g++
+export MPI_CXX=mpicxx
+export PROJECT_CXXFLAGS='-O3 -std=c++17 -Wall -Wextra -Wpedantic'
+export PROJECT_OPENMP_FLAGS='-fopenmp'
+export PROJECT_LDFLAGS=''

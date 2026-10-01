@@ -1,0 +1,2 @@
+# Optional plotting dependency. Numerical code and basic summaries use no Python packages.
+matplotlib>=3.8,<4
