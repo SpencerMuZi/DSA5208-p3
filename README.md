@@ -1,131 +1,84 @@
-# DSA5208 Project 3 — C++ / MPI / OpenMP Jacobi solver
+# DSA5208 Project 3: MPI + OpenMP Jacobi solver
 
-这是可运行的项目起步包：serial、MPI、MPI+OpenMP、非阻塞 MPI+OpenMP 四个版本，验证脚本、PBS 作业生成器和三人操作指南。
+Li Yaqi, Lin Jialiang, Li Chongkai.
 
-先读 [ABC 顺序汇总操作指南](docs/ABC_顺序汇总操作指南.md)，按阶段明确先后、并行工作和交接条件；背景与实验设计看 `docs/总实施方案.md`，具体命令按角色看 `docs/A_操作指南_Windows.md`、`docs/B_操作指南_Windows.md`、`docs/C_操作指南_Mac.md`。共同部署步骤在 `docs/共同部署与命令说明.md`。本地验证范围见 `docs/验证记录.md`。
+C++17 implementations of a 2D Poisson solver: serial, MPI, blocking MPI/OpenMP (`hybrid`) and nonblocking MPI/OpenMP (`overlap`). Input is a manufactured problem with exact solution `u=x(1-x)y(1-y)`, zero boundaries and a zero initial guess.
 
-账号/队列/模块与正式实验尚未完成。这里没有 Atlas/Vanda 性能数据，也没有最终 PDF。现有图表和本地日志（如有）只能用于开发验证。
+## Build
 
-## Repository
+Requires Make, a C++17 compiler, MPI and OpenMP. Python 3.9+ is required for scripts.
 
-GitHub repository: [SpencerMuZi/DSA5208-p3](https://github.com/SpencerMuZi/DSA5208-p3)。仓库目前为 private；协作者需要被授予访问权限。
-
-```bash
-git clone https://github.com/SpencerMuZi/DSA5208-p3.git
-cd DSA5208-p3
-```
-
-仓库根目录就是指南中的 Project3 根目录。需要分发给没有 Git 的组员时，运行 `python3 scripts/package.py --kind source`，生成指南使用的 ZIP。仓库跟踪代码、指南和配置示例；生成结果、二进制、.venv、私有集群配置和 dist 分发包留在本地，正式证据在完成实验后按交付说明归档。
-
-## Dependencies and build
-
-- C++17 compiler and Make.
-- MPI C++ wrapper `mpicxx`, and OpenMP runtime.
-- Python 3.9+ for scripts; only optional plotting needs matplotlib.
-- PBS + Open MPI integrated with PBS for the supplied cluster job generator.
-
-Linux with GCC/MPI already loaded:
+On Linux with GCC and MPI installed:
 
 ```bash
 make all
 ```
 
-On a cluster, configure `configs/site_modules.sh` from the example and use:
+For the serial target alone: `make serial`. On macOS with Apple Clang: `make serial CXX=clang++`.
+
+The recorded Atlas environment is GCC 12.3.0, Open MPI 4.1.5, Python 3.11.3 and binutils 2.40. On Atlas:
 
 ```bash
 bash -l scripts/build.sh
 ```
 
-If the MPI wrapper uses another compiler, choose a matching serial compiler and compiler flags. Do not mix binaries built using different MPI installations. The site generator intentionally refuses unknown/unconfirmed cluster settings.
+`configs/site_modules.sh` loads that toolchain. Adapt module paths for another cluster. Flags: `-O3 -std=c++17 -Wall -Wextra -Wpedantic`, with `-fopenmp` for parallel programs. Build records are written to `results/build/`.
 
-## Program options
+## Run
+
+Run MPI commands in a compute allocation or on a local development machine:
 
 ```bash
-bin/jacobi_serial --help
-bin/jacobi_parallel --help
+bin/jacobi_serial --n 17 --mode solve --iters 50000 --check 10 --tol 1e-8
+bin/jacobi_serial --n 1024 --mode benchmark --iters 5000 --check 0
+mpirun -np 4 bin/jacobi_parallel --variant mpi --threads 1 --n 1024 --iters 5000 --check 0
+mpirun -np 4 bin/jacobi_parallel --variant hybrid --threads 2 --n 1024 --iters 5000 --check 0
+mpirun -np 4 bin/jacobi_parallel --variant overlap --threads 2 --n 1024 --iters 5000 --check 0
 ```
 
-| Option | Meaning |
-|---|---|
-| `--n 64` | Interior grid size N×N; boundaries are additional zero-valued points |
-| `--variant serial/mpi/hybrid/overlap` | Implementation; use the corresponding binary |
-| `--mode benchmark/solve` | Fixed work / residual stopping |
-| `--iters 1000` | Fixed iterations, or maximum iterations in solve mode |
-| `--check 0` | Disable timed residual checks in benchmark mode |
-| `--check 10` | Check every 10 iterations; solve always checks the last allowed iteration |
-| `--tol 1e-8` | Relative L2 residual tolerance |
-| `--threads 2` | OpenMP threads per rank; MPI-only requires 1 |
-| `--dump path.csv` | Write interior grid after timing; parent folder must exist |
-| `--profile` | Enable per-phase timing, only for separate diagnostic runs |
+`--n` counts interior points per dimension; ranks must not exceed N. `--mode benchmark` executes exactly `--iters` sweeps. `--mode solve` stops at the relative residual tolerance or iteration limit; it requires `--check` greater than zero. The default mode is benchmark. `--dump grid.csv` exports the final interior grid; create its parent directory first. `--help` lists all options.
 
-Problem: `-Δu=f` on `[0,1]²`, zero boundaries, `u*=x(1-x)y(1-y)`, `f=2[x(1-x)+y(1-y)]`, initial guess zero. The sampled polynomial is an exact solution of the five-point discrete problem up to floating-point error.
+Stdout is one JSON result. Exit status is 0 for a completed benchmark or converged solve, 2 for an unconverged solve, and 1 for invalid input. The report's 5000-sweep timings are fixed-work measurements; the large grids have not converged.
 
-Stdout contains one JSON result. Exit 0 means normal completion; solve mode exits 2 when the maximum iterations end without convergence. Invalid input exits 1 (MPI launchers may translate application abort status). Benchmark does not require convergence.
-
-## Quick local / allocated-node checks
-
-These commands require a local development machine or a scheduler-allocated compute node. Do not launch benchmarks directly on a cluster login node.
+## Validate
 
 ```bash
-bin/jacobi_serial --n 17 --mode solve --iters 50000 --tol 1e-8 --check 10
-mpirun -np 2 bin/jacobi_parallel --variant mpi --n 31 --iters 100 --check 0
-mpirun -np 2 bin/jacobi_parallel --variant hybrid --threads 2 --n 31 --iters 100 --check 0
-mpirun -np 2 bin/jacobi_parallel --variant overlap --threads 2 --n 31 --iters 100 --check 0
 python3 scripts/validate.py --serial-only
-python3 scripts/validate.py --max-cores 4 --launcher 'mpirun -np {ranks}'
+python3 scripts/validate.py --max-cores 4 --launcher 'mpirun -np {ranks} --map-by slot:PE={threads} --bind-to core'
 ```
 
-The last command's simple launcher is for local development; on a cluster use the generator's `verify` job with approved binding.
+The full suite checks serial/parallel grids, uneven partitions, one/two-row ranks, manufactured-solution convergence and error exits. Outputs are written under `results/validation/`. 
 
-## Cluster jobs
+## Atlas PBS jobs
+
+From this source directory, after building:
 
 ```bash
-cp configs/cluster.env.example configs/cluster.env
-cp configs/site_modules.sh.example configs/site_modules.sh
-nano configs/cluster.env
-nano configs/site_modules.sh
-bash -l scripts/build.sh
-python3 scripts/make_jobs.py --preset smoke --iters 100 --repeats 3
+python3 jobs/portable/generate_jobs.py --study validate --output jobs/validate
+cat jobs/validate/validate.pbs
+qsub jobs/validate/validate.pbs
 ```
 
-Fill confirmed site settings first, review the printed `.pbs` file and submit it with `qsub PATH`. No job is submitted by the generator. Subsequent presets: `verify`, `strong`, `weak`, `mix`, `comm`, `check`. See the Chinese guides for resource choices and exact command sequences.
-
-Each benchmark performs an untimed identical warm-up, then fresh-process repetitions. MPI topology is recorded before timing. Solve timing covers only the iteration loop, including checks inside it; process launch, grid construction, final verification and dump are excluded. Each run is valid for aggregation only after its `COMPLETE` marker exists.
-
-## Analysis and packaging
-
-Basic summary uses the Python standard library:
+Generate the experimental matrix:
 
 ```bash
-python3 scripts/analyze.py --official-only
+python3 jobs/portable/generate_jobs.py --study strong --n 512
+python3 jobs/portable/generate_jobs.py --study strong --n 1024
+python3 jobs/portable/generate_jobs.py --study weak --base-n 256
+python3 jobs/portable/generate_jobs.py --study mix --n 1024
+python3 jobs/portable/generate_jobs.py --study comm --n 1024
 ```
 
-For plots, install plotting packages in a local virtual environment:
+The generator prints each output directory and writes its manifest. Inspect resource directives, then submit individual `.pbs` files with `qsub` from the source root (`PBS_O_WORKDIR`). Output directories must be new. Defaults are 5000 sweeps, one warm-up and five measured runs; `--walltime HH:MM:SS` overrides the time limit.
+
+Templates use the recorded `parallel` queue and `par12` node pool, reserving 12 CPUs on one node or 8 CPUs per node on two nodes. Application cores are counted separately. MPI binds ranks to cores; OpenMP uses `OMP_PLACES=cores`, `OMP_PROC_BIND=close` and `OMP_DYNAMIC=FALSE`. Adapt these recorded settings if site configuration changes. Check PBS output and each result directory's `COMPLETE` marker.
+
+## Analyze new measurements
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-analysis.txt
-python scripts/analyze.py --official-only --plots
-python -m pip freeze > report/analysis_requirements_lock.txt
+python3 scripts/analyze.py --input results/raw --output results/summary --official-only
 ```
 
-Grouping prevents comparison across different CPU models, code hashes, compiler records or numerical workloads. Blank speedup means a matching serial baseline is missing. Weak scaling uses constant points per core within rounding tolerance and fixed iteration work.
+`scripts/benchmark.py` records one warm-up and five measured repetitions by default. Solver-loop timing includes halo exchange and thread synchronization; initialization, process launch and final verification are excluded. Strong-scaling speedup uses a matching serial baseline; weak scaling uses its own one-core reference. Efficiency counts application cores, not reserved CPUs.
 
-```bash
-python3 scripts/package.py --kind source
-python3 scripts/package.py --kind full
-python3 scripts/package.py --kind full --final
-```
-
-Source packages contain guides/code/templates; full packages additionally contain results, figures and generated jobs. Local private settings, binaries and virtual environments are excluded. Final packaging requires a real `report/report.pdf`, completed `report/team.csv`, and a completed official multi-node run. It is a basic consistency check; the team must still review report quality, results and Canvas requirements.
-
-## Implementation limits
-
-- One-dimensional row decomposition; at least one interior row per MPI rank.
-- OpenMP parallel regions are created per update/check. Fine-grained overhead may limit small cases.
-- Vector allocation/zero initialization is serial; NUMA first-touch optimization is not implemented.
-- The nonblocking version overlaps local interior computation with halo exchange, but MPI progress and performance gains are implementation dependent.
-- Residual checks refresh current halos and perform a global sum; their full cost is included when inside timing.
-- Phase maxima can come from different ranks; do not sum them as an exact total-time decomposition.
-- The job generator currently targets confirmed Open MPI/PBS configurations. Other site launchers need adaptation and topology verification.
+The solver, Makefile and original scripts retain the experimental fingerprint `465f973ecc1da585034e511423c9021bd58f1007a24e2262acbc509bec145d45`. Use `jobs/portable/generate_jobs.py` for Atlas PBS jobs. The generic `scripts/make_jobs.py` requires a configured `configs/cluster.env`; its defaults are not the recorded Atlas queue settings. `scripts/test_workflow.py` tests that generic generator and analysis safeguards. `scripts/package.py` is an older development utility; its full-report packaging mode is not used by this code-only repository.
