@@ -1,6 +1,7 @@
 #include "common.hpp"
 #include <mpi.h>
 #include <omp.h>
+#include "parallel_3d.hpp"
 
 int main(int argc, char** argv) {
     int provided=0;
@@ -9,7 +10,7 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);
     MPI_Comm_size(MPI_COMM_WORLD,&size);
     try {
-        Options o=parse_options(argc,argv,"mpi");
+        Options o=parse_options(argc,argv,"mpi",3);
         if (o.help) { if (rank==0) print_help(); MPI_Finalize(); return 0; }
         if (provided<MPI_THREAD_FUNNELED) throw std::runtime_error("MPI lacks THREAD_FUNNELED");
         if (o.variant=="serial") throw std::invalid_argument("use serial binary for variant=serial");
@@ -30,6 +31,12 @@ int main(int argc, char** argv) {
         MPI_Allreduce(&actual_threads,&max_threads,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
         if (min_threads!=o.threads || max_threads!=o.threads)
             throw std::runtime_error("actual OpenMP thread count differs from requested threads");
+        if (o.dim==3) {
+            const Result r=solve_parallel_3d(o,rank,size,actual_threads);
+            if (rank==0) print_result(o,r);
+            MPI_Finalize();
+            return (o.mode=="solve" && !r.converged) ? 2 : 0;
+        }
         const int base=o.n/size, remainder=o.n%size;
         const int rows=base+(rank<remainder ? 1 : 0);
         const int offset=rank*base+std::min(rank,remainder);

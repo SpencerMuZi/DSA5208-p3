@@ -1,84 +1,75 @@
-# DSA5208 Project 3: MPI + OpenMP Jacobi solver
+# Parallel Poisson Solver
+
+C++17, double-precision Jacobi iteration for 2D and 3D Poisson equations with zero Dirichlet boundaries. Implementations: true serial, MPI, MPI+OpenMP, nonblocking MPI+OpenMP, and 2D CUDA.
 
 Li Yaqi, Lin Jialiang, Li Chongkai.
 
-C++17 implementations of a 2D Poisson solver: serial, MPI, blocking MPI/OpenMP (`hybrid`) and nonblocking MPI/OpenMP (`overlap`). Input is a manufactured problem with exact solution `u=x(1-x)y(1-y)`, zero boundaries and a zero initial guess.
-
 ## Build
 
-Requires Make, a C++17 compiler, MPI and OpenMP. Python 3.9+ is required for scripts.
+Requirements: C++17 compiler, MPI, OpenMP, Python 3.9+, and Bash. CUDA 12.9 is used for the A40 target (`sm_86`); change `NVCCFLAGS` for other GPUs. Python scripts use only the standard library.
 
-On Linux with GCC and MPI installed:
-
-```bash
-make all
-```
-
-For the serial target alone: `make serial`. On macOS with Apple Clang: `make serial CXX=clang++`.
-
-The recorded Atlas environment is GCC 12.3.0, Open MPI 4.1.5, Python 3.11.3 and binutils 2.40. On Atlas:
+On Vanda, run builds inside a PBS compute allocation:
 
 ```bash
-bash -l scripts/build.sh
+source scripts/environment.sh
+bash scripts/build.sh cpu
+# With a GPU allocation:
+bash scripts/build.sh gpu
 ```
 
-`configs/site_modules.sh` loads that toolchain. Adapt module paths for another cluster. Flags: `-O3 -std=c++17 -Wall -Wextra -Wpedantic`, with `-fopenmp` for parallel programs. Build records are written to `results/build/`.
+On another Linux MPI/OpenMP system, load its compiler/runtime and run `make cpu`. CUDA builds require `CUDA_HOME` and Open MPI's `mpicxx --showme:incdirs`. Override Make variables for other MPI distributions. The serial executable has no OpenMP dependency.
 
-## Run
-
-Run MPI commands in a compute allocation or on a local development machine:
+## Run and validate
 
 ```bash
-bin/jacobi_serial --n 17 --mode solve --iters 50000 --check 10 --tol 1e-8
-bin/jacobi_serial --n 1024 --mode benchmark --iters 5000 --check 0
-mpirun -np 4 bin/jacobi_parallel --variant mpi --threads 1 --n 1024 --iters 5000 --check 0
-mpirun -np 4 bin/jacobi_parallel --variant hybrid --threads 2 --n 1024 --iters 5000 --check 0
-mpirun -np 4 bin/jacobi_parallel --variant overlap --threads 2 --n 1024 --iters 5000 --check 0
+bin/jacobi_serial --variant serial --dim 3 --n 17 --iters 50000 --mode solve --check 10 --tol 1e-8
 ```
 
-`--n` counts interior points per dimension; ranks must not exceed N. `--mode benchmark` executes exactly `--iters` sweeps. `--mode solve` stops at the relative residual tolerance or iteration limit; it requires `--check` greater than zero. The default mode is benchmark. `--dump grid.csv` exports the final interior grid; create its parent directory first. `--help` lists all options.
-
-Stdout is one JSON result. Exit status is 0 for a completed benchmark or converged solve, 2 for an unconverged solve, and 1 for invalid input. The report's 5000-sweep timings are fixed-work measurements; the large grids have not converged.
-
-## Validate
+In a four-core Vanda allocation, the launcher below binds ranks/threads to distinct physical cores within PBS affinity:
 
 ```bash
-python3 scripts/validate.py --serial-only
-python3 scripts/validate.py --max-cores 4 --launcher 'mpirun -np {ranks} --map-by slot:PE={threads} --bind-to core'
+export OMP_NUM_THREADS=1 OMP_PLACES=cores OMP_PROC_BIND=close OMP_DYNAMIC=FALSE
+launch='mpirun -np {ranks} --map-by ppr:{ranks_per_node}:node --bind-to none -x OMP_NUM_THREADS -x OMP_PLACES -x OMP_PROC_BIND -x OMP_DYNAMIC python3 scripts/pin_rank.py --threads {threads} --'
+python3 scripts/validate.py --dim 2 --max-cores 4 --launcher "$launch"
+python3 scripts/validate.py --dim 3 --max-cores 4 --launcher "$launch"
 ```
 
-The full suite checks serial/parallel grids, uneven partitions, one/two-row ranks, manufactured-solution convergence and error exits. Outputs are written under `results/validation/`. 
-
-## Atlas PBS jobs
-
-From this source directory, after building:
+Expected suites: 131 checks in 2D and 93 in 3D, covering grid comparisons, an independent stencil reference, manufactured solutions and error paths. In a one-GPU allocation after the GPU build:
 
 ```bash
-python3 jobs/portable/generate_jobs.py --study validate --output jobs/validate
-cat jobs/validate/validate.pbs
-qsub jobs/validate/validate.pbs
+python3 scripts/validate_cuda.py --gpus 1 --launcher "$launch"
 ```
 
-Generate the experimental matrix:
+This performs seven GPU checks. MPI/hybrid/overlap accept dimensions 2 and 3; CUDA accepts dimension 2 and one distinct GPU per MPI rank. Ranks cannot exceed N. All physical CPU threads are explicitly checked by the benchmark launcher.
+
+## Benchmark on Vanda
+
+From this source directory, substitute your project:
 
 ```bash
-python3 jobs/portable/generate_jobs.py --study strong --n 512
-python3 jobs/portable/generate_jobs.py --study strong --n 1024
-python3 jobs/portable/generate_jobs.py --study weak --base-n 256
-python3 jobs/portable/generate_jobs.py --study mix --n 1024
-python3 jobs/portable/generate_jobs.py --study comm --n 1024
+qsub -P personal-YOUR_ACCOUNT jobs/cpu.pbs
+qsub -P personal-YOUR_ACCOUNT jobs/gpu.pbs
 ```
 
-The generator prints each output directory and writes its manifest. Inspect resource directives, then submit individual `.pbs` files with `qsub` from the source root (`PBS_O_WORKDIR`). Output directories must be new. Defaults are 5000 sweeps, one warm-up and five measured runs; `--walltime HH:MM:SS` overrides the time limit.
+Use a separate clean source directory for each simultaneous job. PBS templates build on their allocated node. They use the `auto` route; `batch_cpu` and `batch_gpu` are not direct submission queues.
 
-Templates use the recorded `parallel` queue and `par12` node pool, reserving 12 CPUs on one node or 8 CPUs per node on two nodes. Application cores are counted separately. MPI binds ranks to cores; OpenMP uses `OMP_PLACES=cores`, `OMP_PROC_BIND=close` and `OMP_DYNAMIC=FALSE`. Adapt these recorded settings if site configuration changes. Check PBS output and each result directory's `COMPLETE` marker.
+`scripts/benchmark.py` excludes one warm-up and retains five fresh-process repetitions by default. A comma-separated `--variants` list rotates execution order within one allocation. Results, commands, topology, binary hashes and min/median/max summaries are written under `results/`. A `COMPLETE` marker is written only after all requested samples finish.
 
-## Analyze new measurements
+Examples inside matching allocations:
 
 ```bash
-python3 scripts/analyze.py --input results/raw --output results/summary --official-only
+# True serial baseline:
+python3 scripts/benchmark.py --variants serial --dim 2 --n 4096 --iters 5000
+# Four CPU cores: two ranks, two OpenMP threads per rank:
+python3 scripts/benchmark.py --variants hybrid --dim 3 --n 256 --iters 200 --ranks 2 --threads 2
+# Same-allocation blocking / overlap comparison:
+python3 scripts/benchmark.py --variants hybrid,overlap --dim 2 --n 8192 --iters 5000 --ranks 2 --threads 2
+# Same-allocation one-GPU / CPU comparison (36 allocated host CPUs):
+python3 scripts/benchmark.py --variants serial,hybrid,cuda --dim 2 --n 1024 --iters 5000 --host-threads 8
 ```
 
-`scripts/benchmark.py` records one warm-up and five measured repetitions by default. Solver-loop timing includes halo exchange and thread synchronization; initialization, process launch and final verification are excluded. Strong-scaling speedup uses a matching serial baseline; weak scaling uses its own one-core reference. Efficiency counts application cores, not reserved CPUs.
+For 256-core MPI, change the CPU PBS resource line to `select=8:ncpus=32:mpiprocs=32:ompthreads=1:mem=16gb:node_pool=cpu_node` and pass `--ranks 256 --threads 1 --nodes 8 --ranks-per-node 32`. For a two-thread hybrid layout, use `mpiprocs=16:ompthreads=2`, ranks=128 and ranks-per-node=16. Keep N/K fixed for strong scaling. For 2D weak scaling, use N=round(256*sqrt(P)), K=5000 and P=1,2,4,...,256.
 
-The solver, Makefile and original scripts retain the experimental fingerprint `465f973ecc1da585034e511423c9021bd58f1007a24e2262acbc509bec145d45`. Use `jobs/portable/generate_jobs.py` for Atlas PBS jobs. The generic `scripts/make_jobs.py` requires a configured `configs/cluster.env`; its defaults are not the recorded Atlas queue settings. `scripts/test_workflow.py` tests that generic generator and analysis safeguards. `scripts/package.py` is an older development utility; its full-report packaging mode is not used by this code-only repository.
+N counts interior points per coordinate. `benchmark` executes exactly K iterations with no in-loop residual checks; `solve` stops at its residual tolerance and exits 2 if the cap is insufficient. Large fixed-work runs can report `converged=false`. CPU/GPU primary times cover solver loops, excluding launch, initialization and final verification. CUDA synchronizes device work before stopping timing. Its `end_to_end_seconds_max` field covers grid setup through final device-to-host transfer, excluding process launch, device selection and final verification.
+
+The numerical source files match the measured solvers. Build/run helpers are packaged for direct use. `CHECKSUMS.json` covers distributed files; generated results and binaries are not included.

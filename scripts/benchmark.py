@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one configuration, recording every repetition and its provenance."""
+"""Measure fixed-work solver loops in a PBS allocation, retaining every repetition."""
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
@@ -8,151 +8,133 @@ import json
 import math
 import os
 from pathlib import Path
-import platform
+import statistics
 import subprocess
-import sys
 import uuid
-
 from validate import ROOT, launcher_command
+from pin_rank import physical_core
 
-
-def source_hash():
-    digest = hashlib.sha256()
-    for path in sorted([ROOT / "Makefile", *ROOT.glob("src/*"), *ROOT.glob("scripts/*.py"),
-                        *ROOT.glob("scripts/*.sh")]):
-        digest.update(str(path.relative_to(ROOT)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def cpu_model():
-    path = Path("/proc/cpuinfo")
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if line.startswith("model name"):
-                return line.partition(":")[2].strip()
-    return platform.processor() or platform.machine()
-
+LAUNCH = ('mpirun -np {ranks} --map-by ppr:{ranks_per_node}:node --bind-to none '
+          '-x OMP_NUM_THREADS -x OMP_PLACES -x OMP_PROC_BIND -x OMP_DYNAMIC '
+          'python3 scripts/pin_rank.py --threads {threads} --')
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--variant",choices=("serial","mpi","hybrid","overlap"),required=True)
-    p.add_argument("--n",type=int,required=True)
-    p.add_argument("--iters",type=int,default=1000)
-    p.add_argument("--mode",choices=("benchmark","solve"),default="benchmark")
-    p.add_argument("--check",type=int,default=0)
-    p.add_argument("--tol",type=float,default=1e-8)
-    p.add_argument("--ranks",type=int,default=1)
-    p.add_argument("--threads",type=int,default=1)
-    p.add_argument("--ranks-per-node",type=int)
-    p.add_argument("--nodes",type=int,default=1)
-    p.add_argument("--repeats",type=int,default=5)
-    p.add_argument("--launcher",default="mpirun -np {ranks}")
-    p.add_argument("--cluster",default="LOCAL_UNOFFICIAL")
-    p.add_argument("--family",default="development")
-    p.add_argument("--profile",action="store_true")
-    p.add_argument("--output",type=Path)
-    p.add_argument("--timeout",type=int,default=3600)
-    args = p.parse_args()
-    if min(args.ranks,args.threads,args.nodes,args.repeats,args.timeout) < 1:
-        p.error("ranks, threads, nodes, repeats, timeout must be positive")
-    if args.variant == "serial" and (args.ranks != 1 or args.threads != 1 or args.nodes != 1):
-        p.error("serial requires ranks=threads=nodes=1")
-    if args.variant == "mpi" and args.threads != 1:
-        p.error("mpi requires threads=1")
-    ppn = args.ranks_per_node or args.ranks // args.nodes
-    if ppn*args.nodes != args.ranks:
-        p.error("uniform ranks_per_node*nodes must equal ranks")
-    if args.cluster in ("Atlas","Vanda") and not (os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID")):
-        p.error("official cluster label requires a scheduler allocation")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    run_id = stamp + "-" + uuid.uuid4().hex[:8]
-    folder = args.output or ROOT / "results" / "raw" / run_id
-    folder.mkdir(parents=True,exist_ok=False)
-    binary = ROOT / "bin" / ("jacobi_serial" if args.variant == "serial" else "jacobi_parallel")
-    command = [] if args.variant == "serial" else launcher_command(args.launcher,args.ranks,args.threads,ppn)
-    command += [str(binary),"--variant",args.variant,"--n",str(args.n),"--iters",str(args.iters),
-                "--mode",args.mode,"--check",str(args.check),"--tol",str(args.tol),
-                "--threads",str(args.threads)]
-    if args.profile:
-        command.append("--profile")
-    env = os.environ.copy()
-    env.update(OMP_NUM_THREADS=str(args.threads),OMP_DYNAMIC="FALSE")
-    hosts=[]
-    nodefile = os.environ.get("PBS_NODEFILE")
-    if nodefile and Path(nodefile).exists():
-        hosts=sorted(set(Path(nodefile).read_text().splitlines()))
-    metadata = dict(run_id=run_id,date_utc=stamp,cluster=args.cluster,family=args.family,
-                    nodes=args.nodes,ranks_per_node=ppn,hosts=hosts,
-                    cpu_model=cpu_model(),source_hash=source_hash(),command=command,
-                    binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
-                    job_id=os.environ.get("PBS_JOBID",os.environ.get("SLURM_JOB_ID","local")),
-                    binding={k:env.get(k,"") for k in ("OMP_PLACES","OMP_PROC_BIND","OMP_DYNAMIC")})
-    if hosts and len(hosts)!=args.nodes:
-        raise RuntimeError(f"allocation contains {len(hosts)} hosts, expected {args.nodes}")
-    build_info = ROOT / "results" / "build" / "build.txt"
-    if args.cluster in ("Atlas","Vanda") and not build_info.exists():
-        raise RuntimeError("official runs require results/build/build.txt from scripts/build.sh")
-    if build_info.exists():
-        metadata["build_info"] = build_info.read_text()
-        # Ignore timestamp/hostname lines while retaining compiler versions and flags.
-        signature_lines=metadata["build_info"].splitlines()[2:]
-        metadata["build_signature"]=hashlib.sha256('\n'.join(signature_lines).encode()).hexdigest()
-    else:
-        metadata["build_signature"]="UNRECORDED"
-    (folder/"metadata.json").write_text(json.dumps(metadata,indent=2)+"\n")
-    # All MPI configurations record actual host/thread placement using the same launcher.
-    if args.variant != "serial":
-        topology_cmd = launcher_command(args.launcher,args.ranks,args.threads,ppn)+[str(ROOT/"bin"/"hello_hybrid")]
-        topo=subprocess.run(topology_cmd,cwd=ROOT,env=env,capture_output=True,text=True,timeout=120)
-        (folder/"topology.command.json").write_text(json.dumps(topology_cmd,indent=2)+"\n")
-        (folder/"topology.stdout.jsonl").write_text(topo.stdout)
-        (folder/"topology.stderr.txt").write_text(topo.stderr)
-        if topo.returncode:
-            raise RuntimeError("topology launch failed")
-        records=[json.loads(s) for s in topo.stdout.splitlines() if s.startswith('{"rank":')]
-        if len(records)!=args.ranks or any(r["threads"]!=args.threads for r in records):
-            raise RuntimeError("actual ranks/threads differ from requested configuration")
-        if sorted(r["rank"] for r in records)!=list(range(args.ranks)):
-            raise RuntimeError("topology rank IDs are missing or duplicated")
-        if len(set(r["host"] for r in records))!=args.nodes:
-            raise RuntimeError("actual MPI host count differs from requested nodes")
-        if any(count!=ppn for count in Counter(r["host"] for r in records).values()):
-            raise RuntimeError("actual ranks per host differ from requested uniform layout")
-    with (folder/"measurements.jsonl").open("w") as output:
-        # Warm-up repeats the identical workload. Each invocation allocates a fresh zero grid.
-        for repeat in range(args.repeats+1):
-            process=subprocess.run(command,cwd=ROOT,env=env,text=True,capture_output=True,timeout=args.timeout)
-            label="warmup" if repeat==0 else f"repeat-{repeat}"
-            (folder/f"{label}.stdout.txt").write_text(process.stdout)
-            (folder/f"{label}.stderr.txt").write_text(process.stderr)
-            if process.returncode:
-                raise RuntimeError(f"{label}: solver exit {process.returncode}; see {folder}")
-            result=[json.loads(s) for s in process.stdout.splitlines() if s.startswith('{"variant":')]
-            if len(result)!=1:
-                raise RuntimeError(f"{label}: expected exactly one result JSON")
-            record=result[0]
-            if any(not math.isfinite(record[k]) for k in ("solve_seconds_max","final_residual","relative_error_l2","error_max")):
-                raise RuntimeError("non-finite numerical result")
-            if record["ranks"]!=args.ranks or record["threads"]!=args.threads:
-                raise RuntimeError("solver rank/thread count mismatch")
-            if args.mode=="benchmark" and record["iterations"]!=args.iters:
-                raise RuntimeError("fixed-work benchmark iteration count mismatch")
-            if args.mode=="solve" and not record["converged"]:
-                raise RuntimeError("unconverged solve must not be included as a completed solve")
-            if repeat:
-                record.update(metadata)
-                record["repeat"]=repeat
-                output.write(json.dumps(record)+"\n")
-                output.flush()
-                print(f"{label}: {record['solve_seconds_max']:.6f}s residual={record['final_residual']:.3e}")
-    (folder/"COMPLETE").write_text("All requested repetitions completed.\n")
-    print(f"Evidence: {folder}")
+    p.add_argument('--variants', default='mpi', help='One variant, or comma-separated paired variants')
+    p.add_argument('--dim', type=int, choices=[2, 3], default=2)
+    p.add_argument('--n', type=int, required=True)
+    p.add_argument('--iters', type=int, required=True)
+    p.add_argument('--ranks', type=int, default=1)
+    p.add_argument('--threads', type=int, default=1)
+    p.add_argument('--nodes', type=int, default=1)
+    p.add_argument('--ranks-per-node', type=int)
+    p.add_argument('--host-threads', type=int, default=8)
+    p.add_argument('--repeats', type=int, default=5)
+    p.add_argument('--timeout', type=int, default=3600)
+    p.add_argument('--launcher', default=LAUNCH)
+    p.add_argument('--output', type=Path)
+    a = p.parse_args()
+    variants = a.variants.split(',')
+    allowed = {'serial', 'mpi', 'hybrid', 'overlap', 'cuda'}
+    if not os.environ.get('PBS_JOBID'):
+        p.error('Run inside a PBS compute allocation')
+    if len(set(variants)) != len(variants) or not set(variants) <= allowed:
+        p.error('Choose distinct variants from serial,mpi,hybrid,overlap,cuda')
+    if min(a.n, a.iters, a.ranks, a.threads, a.nodes, a.repeats, a.timeout, a.host_threads) < 1:
+        p.error('Sizes, resource counts, repeats and timeout must be positive')
+    ppn = a.ranks_per_node or a.ranks
+    if ppn < 1 or ppn * a.nodes != a.ranks or a.ranks > a.n:
+        p.error('Uniform rank/node layout and ranks <= N required')
+    gpu_pair = 'cuda' in variants and len(variants) > 1
+    if gpu_pair and (set(variants) != {'serial', 'hybrid', 'cuda'} or a.ranks != 1 or a.nodes != 1):
+        p.error('GPU comparison requires serial,hybrid,cuda on one node with one GPU rank')
+    if 'cuda' in variants and a.dim != 2:
+        p.error('CUDA implements dimension 2')
+    folder = a.output or ROOT / 'results' / ('run-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
+    folder.mkdir(parents=True, exist_ok=False)
+    sessions = {}
+    for variant in variants:
+        ranks = 1 if variant == 'serial' else a.ranks
+        threads = 1 if variant in ['serial', 'mpi', 'cuda'] else a.host_threads if gpu_pair else a.threads
+        binary = ROOT / 'bin' / ('jacobi_serial' if variant == 'serial' else 'jacobi_cuda' if variant == 'cuda' else 'jacobi_parallel')
+        env = dict(os.environ, OMP_NUM_THREADS=str(threads), OMP_PLACES='cores', OMP_PROC_BIND='close', OMP_DYNAMIC='FALSE')
+        if variant == 'serial':
+            cpu = min(os.sched_getaffinity(0))
+            launch = ['taskset', '-c', str(cpu)]
+            topology = [dict(rank=0, host=os.uname().nodename, threads=1, thread_physical_cores=[':'.join(map(str, physical_core(cpu)))])]
+        else:
+            launch = launcher_command(a.launcher, ranks, threads, ppn)
+            probe = [str(binary), '--topology'] if variant == 'cuda' else [str(ROOT / 'bin/hello_hybrid')]
+            result = subprocess.run(launch + probe, cwd=ROOT, env=env, capture_output=True, text=True, timeout=a.timeout)
+            (folder / (variant + '-topology.stdout.txt')).write_text(result.stdout)
+            (folder / (variant + '-topology.stderr.txt')).write_text(result.stderr)
+            if result.returncode:
+                raise RuntimeError('Topology command failed: ' + variant)
+            topology = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"rank":')]
+            if sorted(t['rank'] for t in topology) != list(range(ranks)):
+                raise ValueError('Missing/duplicate ranks in topology')
+            hosts = Counter(t['host'] for t in topology)
+            if len(hosts) != a.nodes or any(n != ppn for n in hosts.values()):
+                raise ValueError('Actual node/rank layout differs from request')
+        cores = set()
+        devices = set()
+        for t in topology:
+            masks = t.get('thread_physical_cores', [])
+            if t['threads'] != threads or len(masks) != threads:
+                raise ValueError('Actual thread count differs from request')
+            for mask in masks:
+                key = (t['host'], mask)
+                if not mask or ',' in mask or 'unavailable' in mask or key in cores:
+                    raise ValueError('Missing or overlapping physical CPU binding')
+                cores.add(key)
+            if variant == 'cuda':
+                key = (t['host'], t['gpu_uuid'])
+                if key in devices:
+                    raise ValueError('Multiple ranks selected the same GPU')
+                devices.add(key)
+        command = launch + [str(binary), '--variant', variant, '--dim', str(a.dim), '--n', str(a.n), '--iters', str(a.iters), '--mode', 'benchmark', '--check', '0', '--threads', str(threads)]
+        sessions[variant] = dict(command=command, env=env, topology=topology, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), rows=[])
+    metadata = dict(job_id=os.environ['PBS_JOBID'], arguments=vars(a) | {'output': str(folder)}, variants={v: {k: s[k] for k in ['command', 'topology', 'binary_sha256']} for v, s in sessions.items()})
+    (folder / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    def execute(variant, repeat):
+        s = sessions[variant]
+        result = subprocess.run(s['command'], cwd=ROOT, env=s['env'], capture_output=True, text=True, timeout=a.timeout)
+        label = variant + ('-warmup' if repeat == 0 else '-repeat-' + str(repeat))
+        (folder / (label + '.stdout.txt')).write_text(result.stdout)
+        (folder / (label + '.stderr.txt')).write_text(result.stderr)
+        if result.returncode:
+            raise RuntimeError(label + ': solver failed')
+        rows = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"variant":')]
+        if len(rows) != 1:
+            raise ValueError(label + ': expected one solver result')
+        r = rows[0]
+        if (r['variant'], r['dim'], r['n'], r['iterations']) != (variant, a.dim, a.n, a.iters) or r['check_interval'] != 0 or r['profile']:
+            raise ValueError(label + ': workload mismatch')
+        if not math.isfinite(r['solve_seconds_max']) or r['solve_seconds_max'] <= 0:
+            raise ValueError(label + ': invalid elapsed time')
+        if repeat:
+            r.update(repeat=repeat, binary_sha256=s['binary_sha256'], job_id=os.environ['PBS_JOBID'])
+            s['rows'].append(r)
+            with (folder / 'measurements.jsonl').open('a') as f:
+                f.write(json.dumps(r) + '\n')
+    for v in variants:
+        execute(v, 0)
+    order = []
+    for repeat in range(1, a.repeats + 1):
+        shift = (repeat - 1) % len(variants)
+        sequence = variants[shift:] + variants[:shift]
+        order.append(sequence)
+        for v in sequence:
+            execute(v, repeat)
+    summaries = []
+    for v, s in sessions.items():
+        values = [r['solve_seconds_max'] for r in s['rows']]
+        summaries.append(dict(variant=v, samples=len(values), median_seconds=statistics.median(values), min_seconds=min(values), max_seconds=max(values)))
+    (folder / 'run_order.json').write_text(json.dumps(order, indent=2) + '\n')
+    (folder / 'summary.json').write_text(json.dumps(summaries, indent=2) + '\n')
+    (folder / 'COMPLETE').write_text('All requested warm-ups and measured repetitions completed.\n')
+    print(json.dumps(summaries, indent=2))
+    print('Results:', folder)
 
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}",file=sys.stderr)
-        sys.exit(1)
+if __name__ == '__main__':
+    main()

@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "topology.hpp"
 #include <mpi.h>
 #include <omp.h>
 #ifdef __linux__
@@ -13,36 +14,25 @@ int main(int argc,char** argv) {
     if (provided<MPI_THREAD_FUNNELED) MPI_Abort(MPI_COMM_WORLD,1);
     char hostname[MPI_MAX_PROCESSOR_NAME]; int len=0;
     MPI_Get_processor_name(hostname,&len);
-    std::vector<std::string> masks(omp_get_max_threads());
+    std::vector<std::string> masks(omp_get_max_threads()), physical(omp_get_max_threads());
     int actual=1;
     #pragma omp parallel
     {
         int thread=omp_get_thread_num();
         #pragma omp single
         actual=omp_get_num_threads();
-        std::ostringstream mask;
-        #ifdef __linux__
-        cpu_set_t cpus;
-        CPU_ZERO(&cpus);
-        if (sched_getaffinity(0,sizeof(cpus),&cpus)==0) {
-            bool first=true;
-            for (int c=0;c<CPU_SETSIZE;++c) if (CPU_ISSET(c,&cpus)) {
-                if (!first) mask << ',';
-                mask << c;
-                first=false;
-            }
-        } else mask << "unavailable";
-        #else
-        mask << "unavailable_on_this_OS";
-        #endif
-        masks[thread]=mask.str();
+        auto mask=local_cpu_masks();
+        masks[thread]=mask.first;
+        physical[thread]=mask.second;
     }
     std::ostringstream s;
     s << "{\"rank\":" << rank << ",\"size\":" << size << ",\"host\":"
       << json_string(std::string(hostname,len)) << ",\"threads\":" << actual
       << ",\"mpi_thread_support\":" << provided << ",\"thread_cpu_masks\":[";
     for (int t=0;t<actual;++t) { if (t) s << ','; s << json_string(masks[t]); }
-    s << "]}";
+    s << "],\"thread_physical_cores\":[";
+    for (int t=0;t<actual;++t) { if(t) s<<','; s<<json_string(physical[t]); }
+    s << "],\"cpu_model\":" << json_string(local_cpu_model()) << "}";
     std::string local=s.str();
     int local_len=static_cast<int>(local.size());
     std::vector<int> lengths(size),offsets(size);

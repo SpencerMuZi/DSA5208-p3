@@ -1,12 +1,5 @@
 bin/
 results/
-figures/
-dist/
-.venv/
 __pycache__/
-*.py[cod]
-*.o
+*.pyc
 .DS_Store
-configs/cluster.env
-jobs/portable/generated/
-jobs/validate/

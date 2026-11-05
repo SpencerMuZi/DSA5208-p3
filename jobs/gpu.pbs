@@ -1,0 +1,13 @@
+#!/bin/bash
+#PBS -N jacobi-gpu
+#PBS -q auto
+#PBS -l select=1:ncpus=36:mpiprocs=1:ompthreads=8:mem=240gb:ngpus=1:node_pool=gpu_node
+#PBS -l place=scatter
+#PBS -l walltime=02:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit from the source root}"
+source scripts/environment.sh
+bash scripts/build.sh gpu
+python3 scripts/benchmark.py --variants serial,hybrid,cuda --dim 2 --n 1024 --iters 5000 \
+    --ranks 1 --threads 1 --nodes 1 --ranks-per-node 1 --host-threads 8
